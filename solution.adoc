@@ -8,7 +8,7 @@ La source de la dataset vient  Yelp. https://business.yelp.com/data/resources/op
 Qui fournit un ensemble de data Open pour des usages divers.
 Fichier format zip est fourni avec le contenu complet des données.
 
-== Votre tache
+== Tache
 Vous allez essayer de lire et de comprendre la structure des données fournies.
 Construire des requetes cypher d'import des données dans neo4j.
 Le Modele final des données dans neo4j doit etre conforme à :
