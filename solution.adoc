@@ -1,64 +1,506 @@
-= Sujet :
+// =============================================================================
+// PROJET NEO4J YELP - IMPORT ET ANALYSE GDS
+// Auteur: Ibrahima BA
+// Dataset: Yelp Open Dataset (https://www.yelp.com/dataset)
+// =============================================================================
 
-Ce projet à pour objectif de vous familiariser aux procedures de modelisation et d'import
-de données brutes dans neo4j.
+// -----------------------------------------------------------------------------
+// ÉTAPE 0: CONFIGURATION ET OPTIMISATION DE LA BASE
+// -----------------------------------------------------------------------------
 
-[Note]
-La source de la dataset vient  Yelp. https://business.yelp.com/data/resources/open-dataset/
-Qui fournit un ensemble de data Open pour des usages divers.
-Fichier format zip est fourni avec le contenu complet des données.
+// 0.1 Vérification et création des contraintes d'unicité (performance critique)
+CREATE CONSTRAINT business_id IF NOT EXISTS
+FOR (b:Business) REQUIRE b.id IS UNIQUE;
 
-== Tache
-Vous allez essayer de lire et de comprendre la structure des données fournies.
-Construire des requetes cypher d'import des données dans neo4j.
-Le Modele final des données dans neo4j doit etre conforme à :
+CREATE CONSTRAINT user_id IF NOT EXISTS
+FOR (u:User) REQUIRE u.id IS UNIQUE;
 
-image:modele.png[modele.png]
+CREATE CONSTRAINT review_id IF NOT EXISTS
+FOR (r:Review) REQUIRE r.id IS UNIQUE;
 
+CREATE CONSTRAINT category_name IF NOT EXISTS
+FOR (c:Category) REQUIRE c.name IS UNIQUE;
 
-== Recommendations
-Vous pouvez vous inspirer de ce qui est fait sur la dataset stackoverflow en classe
-Vous etes libre de données le nom que vous souhaitiez à votre base de donnée.
-Exemple : yelp comme le nom de la source qui fournit ces données.
-Les requetes cypher cles pour l'import :
+// 0.2 Création des index pour accélérer les requêtes
+CREATE INDEX business_name_idx IF NOT EXISTS
+FOR (b:Business) ON (b.name);
 
-----
-1 . apoc.load.json
-2 . UNWIND
-3. MERGE
-----
+CREATE INDEX user_name_idx IF NOT EXISTS
+FOR (u:User) ON (u.name);
 
-== Optionnel
-Ce n'est pas une necessité mais je vous donne la requte qui vous permet
-de figer le schema de votre base avant import des données.
-----
-call apoc.schema.assert({Category:['name'],Business:['name']},
-{Business:['id'],User:['id'],Review:['id']}
+CREATE INDEX review_stars_idx IF NOT EXISTS
+FOR (r:Review) ON (r.stars);
+
+// 0.3 Configuration mémoire pour import massif
+CALL apoc.conf.set('dbms.memory.heap.max_size', '4G');
+
+// -----------------------------------------------------------------------------
+// ÉTAPE 1: IMPORT DES BUSINESS ET CATÉGORIES (Optimisé)
+// -----------------------------------------------------------------------------
+
+// 1.1 Import avec traitement des attributs imbriqués et géolocalisation
+CALL apoc.periodic.iterate(
+  "CALL apoc.load.json('file:///yelp_academic_dataset_business.json') YIELD value RETURN value",
+  "
+  WITH value
+  MERGE (b:Business {id: value.business_id})
+  SET 
+    b.name = value.name,
+    b.stars = value.stars,
+    b.review_count = value.review_count,
+    b.latitude = value.latitude,
+    b.longitude = value.longitude,
+    b.city = value.city,
+    b.state = value.state,
+    b.is_open = value.is_open,
+    b.location = point({latitude: value.latitude, longitude: value.longitude})
+  
+  // Traitement des attributs optionnels (Parking, WiFi, etc.)
+  FOREACH (attr IN CASE WHEN value.attributes IS NOT NULL THEN [value.attributes] ELSE [] END |
+    SET b.attributes = apoc.convert.toJson(attr)
+  )
+  
+  // Traitement des horaires d'ouverture
+  FOREACH (hours IN CASE WHEN value.hours IS NOT NULL THEN [value.hours] ELSE [] END |
+    SET b.hours = apoc.convert.toJson(hours)
+  )
+  
+  WITH b, value
+  UNWIND CASE 
+    WHEN value.categories IS NULL OR value.categories = '' THEN [null]
+    ELSE apoc.text.split(value.categories, ',\\\\s*')
+  END AS categoryName
+  
+  WITH b, categoryName
+  WHERE categoryName IS NOT NULL
+  MERGE (c:Category {name: trim(categoryName)})
+  MERGE (b)-[:IN_CATEGORY]->(c)
+  ",
+  {batchSize: 1000, parallel: false, retries: 2}
 );
-----
 
-== Analyse et exploration de la données
+// -----------------------------------------------------------------------------
+// ÉTAPE 2: IMPORT DES UTILISATEURS ET RELATIONS D'AMITIÉ (Optimisé)
+// -----------------------------------------------------------------------------
 
-Vous avez la possibilité  de charger une partie de la données
-sans persistence.
-Exemple :
-[source,cypher]
-----
-call apoc.load.json('file:///D:/yelp/yelp_dataset/yelp_academic_dataset_business.json')
-  yield value
-  return value limit 25
-----
+// 2.1 Import des utilisateurs avec métriques d'élite et votes
+CALL apoc.periodic.iterate(
+  "CALL apoc.load.json('file:///yelp_academic_dataset_user.json') YIELD value RETURN value",
+  "
+  WITH value
+  MERGE (u:User {id: value.user_id})
+  SET 
+    u.name = value.name,
+    u.review_count = value.review_count,
+    u.yelping_since = datetime(value.yelping_since),
+    u.useful = value.useful,
+    u.funny = value.funny,
+    u.cool = value.cool,
+    u.fans = value.fans,
+    u.average_stars = value.average_stars,
+    u.elite = CASE WHEN value.elite IS NOT NULL AND value.elite <> '' THEN apoc.text.split(value.elite, ',') ELSE [] END,
+    u.compliment_hot = value.compliment_hot,
+    u.compliment_more = value.compliment_more,
+    u.compliment_profile = value.compliment_profile,
+    u.compliment_cute = value.compliment_cute,
+    u.compliment_list = value.compliment_list,
+    u.compliment_note = value.compliment_note,
+    u.compliment_plain = value.compliment_plain,
+    u.compliment_cool = value.compliment_cool,
+    u.compliment_funny = value.compliment_funny,
+    u.compliment_writer = value.compliment_writer,
+    u.compliment_photos = value.compliment_photos
+  ",
+  {batchSize: 1000, parallel: false}
+);
 
-== 1. Creation des noeuds Business et Categories et relationships IN_CATEGORY
+// 2.2 Création des relations d'amitié (approche optimisée pour graphe sparse)
+CALL apoc.periodic.iterate(
+  "CALL apoc.load.json('file:///yelp_academic_dataset_user.json') YIELD value 
+   WHERE value.friends IS NOT NULL AND value.friends <> ''
+   RETURN value.user_id as userId, apoc.text.split(value.friends, ',\\\\s*') as friendsList",
+  "
+  UNWIND friendsList as friendId
+  WITH userId, trim(friendId) as cleanFriendId
+  WHERE cleanFriendId <> ''
+  MATCH (u1:User {id: userId})
+  MATCH (u2:User {id: cleanFriendId})
+  WHERE u1.id < u2.id  // Éviter les doublons bidirectionnels
+  MERGE (u1)-[:FRIENDS]-(u2)
+  ",
+  {batchSize: 500, parallel: false, retries: 3}
+);
 
+// -----------------------------------------------------------------------------
+// ÉTAPE 3: IMPORT DES REVIEWS AVEC SENTIMENT ET TEMPORALITÉ (Optimisé)
+// -----------------------------------------------------------------------------
 
-[source,cypher]
-----
-CALL apoc.load.json('file:///D:/yelp/yelp_dataset/yelp_academic_dataset_business.json')
-YIELD value
-WITH value
-MERGE(b:Business{id:value.business_id})
-SET b += apoc.map.clean(value,['attributes','hours','business_id','categories','address','postal_code'],[])
+// 3.1 Import des reviews avec création des relations temporelles
+CALL apoc.periodic.iterate(
+  "CALL apoc.load.json('file:///yelp_academic_dataset_review.json') YIELD value RETURN value",
+  "
+  WITH value
+  MATCH (b:Business {id: value.business_id})
+  MATCH (u:User {id: value.user_id})
+  
+  CREATE (r:Review {
+    id: value.review_id,
+    stars: value.stars,
+    text: value.text,
+    date: datetime(value.date),
+    useful: value.useful,
+    funny: value.funny,
+    cool: value.cool,
+    sentiment_score: CASE 
+      WHEN value.stars >= 4 THEN 1.0
+      WHEN value.stars = 3 THEN 0.0
+      ELSE -1.0
+    END
+  })
+  
+  CREATE (u)-[:WROTE {date: datetime(value.date)}]->(r)
+  CREATE (r)-[:REVIEWS {stars: value.stars}]->(b)
+  
+  // Relation implicite User -> Business pour algorithmes de recommandation
+  MERGE (u)-[inter:INTERACTED_WITH]->(b)
+  SET 
+    inter.weight = coalesce(inter.weight, 0) + 1,
+    inter.last_review_date = datetime(value.date),
+    inter.avg_stars = (coalesce(inter.avg_stars, 0) * coalesce(inter.review_count, 0) + value.stars) / (coalesce(inter.review_count, 0) + 1),
+    inter.review_count = coalesce(inter.review_count, 0) + 1
+  ",
+  {batchSize: 1000, parallel: false, retries: 2}
+);
+
+// 3.2 Import des tips (avis courts) comme interactions supplémentaires
+CALL apoc.periodic.iterate(
+  "CALL apoc.load.json('file:///yelp_academic_dataset_tip.json') YIELD value RETURN value",
+  "
+  WITH value
+  MATCH (b:Business {id: value.business_id})
+  MATCH (u:User {id: value.user_id})
+  
+  CREATE (t:Tip {
+    text: value.text,
+    date: datetime(value.date),
+    compliment_count: value.compliment_count
+  })
+  
+  CREATE (u)-[:TIPPED {date: datetime(value.date)}]->(t)
+  CREATE (t)-[:ABOUT]->(b)
+  
+  // Mise à jour de la relation d'interaction
+  MERGE (u)-[inter:INTERACTED_WITH]->(b)
+  SET 
+    inter.tip_count = coalesce(inter.tip_count, 0) + 1,
+    inter.weight = coalesce(inter.weight, 0) + 0.5
+  ",
+  {batchSize: 1000, parallel: false}
+);
+
+// -----------------------------------------------------------------------------
+// ÉTAPE 4: CHECK-IN ET ACTIVITÉ TEMPORELLE (Bonus)
+// -----------------------------------------------------------------------------
+
+// 4.1 Import des check-ins pour enrichir les métriques d'engagement
+CALL apoc.periodic.iterate(
+  "CALL apoc.load.json('file:///yelp_academic_dataset_checkin.json') YIELD value RETURN value",
+  "
+  WITH value
+  MATCH (b:Business {id: value.business_id})
+  WITH b, apoc.text.split(value.date, ',\\\\s*') as checkinDates
+  UNWIND checkinDates as checkinDate
+  WITH b, trim(checkinDate) as cleanDate
+  WHERE cleanDate <> ''
+  WITH b, datetime(cleanDate) as dt
+  MERGE (b)-[c:CHECKIN {date: dt}]->(b)
+  SET c.count = coalesce(c.count, 0) + 1
+  ",
+  {batchSize: 500, parallel: false}
+);
+
+// -----------------------------------------------------------------------------
+// ÉTAPE 5: GRAPH DATA SCIENCE (GDS) - PIPELINE DE RECOMMANDATION
+// -----------------------------------------------------------------------------
+
+// 5.1 Création des projections de graphe pour les algorithmes
+
+// Projection User-Business (Bipartite pour Collaborative Filtering)
+CALL gds.graph.project(
+  'user-business-interactions',
+  ['User', 'Business'],
+  {
+    INTERACTED_WITH: {
+      properties: ['weight', 'avg_stars', 'review_count']
+    },
+    WROTE: {
+      orientation: 'REVERSE'
+    },
+    REVIEWS: {
+      orientation: 'REVERSE'
+    }
+  }
+) YIELD graphName, nodeCount, relationshipCount;
+
+// Projection Social (User-User pour Trust-based Recommendation)
+CALL gds.graph.project(
+  'social-graph',
+  'User',
+  {
+    FRIENDS: {
+      orientation: 'UNDIRECTED'
+    }
+  }
+) YIELD graphName, nodeCount, relationshipCount;
+
+// Projection Business-Category (Content-based)
+CALL gds.graph.project(
+  'business-categories',
+  ['Business', 'Category'],
+  'IN_CATEGORY'
+) YIELD graphName, nodeCount, relationshipCount;
+
+// Projection Complète pour Node Embeddings
+CALL gds.graph.project(
+  'yelp-complete',
+  ['User', 'Business', 'Category', 'Review'],
+  ['INTERACTED_WITH', 'FRIENDS', 'IN_CATEGORY', 'WROTE', 'REVIEWS'],
+  {
+    relationshipProperties: ['weight', 'stars', 'sentiment_score']
+  }
+) YIELD graphName, nodeCount, relationshipCount;
+
+// -----------------------------------------------------------------------------
+// 5.2 ALGORITHME 1: SIMILARITÉ DE CONTENU (Content-Based Filtering)
+// -----------------------------------------------------------------------------
+
+// Jaccard Similarity entre Business basée sur les catégories
+CALL gds.nodeSimilarity.stream('business-categories', {
+  topK: 10,
+  similarityCutoff: 0.1
+})
+YIELD node1, node2, similarity
+WITH gds.util.asNode(node1) as b1, gds.util.asNode(node2) as b2, similarity
+WHERE b1.id <> b2.id
+MERGE (b1)-[s:SIMILAR_CONTENT]->(b2)
+SET s.score = similarity, s.algorithm = 'jaccard';
+
+// -----------------------------------------------------------------------------
+// 5.3 ALGORITHME 2: FACTORISATION DE MATRICE (Collaborative Filtering)
+// -----------------------------------------------------------------------------
+
+// FastRP (Fast Random Projection) pour embeddings de nœuds
+CALL gds.fastRP.mutate('user-business-interactions', {
+  embeddingDimension: 128,
+  randomSeed: 42,
+  iterationWeights: [0.0, 1.0, 1.0],
+  mutateProperty: 'embedding'
+}) YIELD nodePropertiesWritten;
+
+// Export des embeddings pour visualisation ou ML externe
+CALL gds.graph.streamNodeProperty('user-business-interactions', 'embedding')
+YIELD nodeId, propertyValue
+WITH gds.util.asNode(nodeId) as node, propertyValue as embedding
+SET node.embedding = embedding;
+
+// -----------------------------------------------------------------------------
+// 5.4 ALGORITHME 3: CENTRALITÉ ET INFLUENCE (Social Recommendation)
+// -----------------------------------------------------------------------------
+
+// PageRank sur le graphe social pour identifier les influenceurs
+CALL gds.pageRank.stream('social-graph', {
+  maxIterations: 20,
+  dampingFactor: 0.85
+})
+YIELD nodeId, score
+WITH gds.util.asNode(nodeId) as user, score
+SET user.pagerank = score,
+    user.influence_tier = CASE 
+      WHEN score > 0.01 THEN 'High'
+      WHEN score > 0.001 THEN 'Medium'
+      ELSE 'Low'
+    END;
+
+// Betweenness Centrality pour détecter les ponts entre communautés
+CALL gds.betweenness.stream('social-graph')
+YIELD nodeId, score
+WITH gds.util.asNode(nodeId) as user, score
+SET user.betweenness = score;
+
+// -----------------------------------------------------------------------------
+// 5.5 ALGORITHME 4: DÉTECTION DE COMMUNAUTÉS
+// -----------------------------------------------------------------------------
+
+// Louvain Modularity pour regrouper les utilisateurs par communauté
+CALL gds.louvain.stream('social-graph', {
+  maxLevels: 10,
+  maxIterations: 100,
+  tolerance: 0.0001
+})
+YIELD nodeId, communityId, intermediateCommunityIds
+WITH gds.util.asNode(nodeId) as user, communityId
+SET user.community = communityId;
+
+// Analyse des communautés les plus actives
+MATCH (u:User)
+WITH u.community as community, count(*) as size, avg(u.review_count) as avgReviews
+WHERE size > 10
+RETURN community, size, avgReviews
+ORDER BY size DESC
+LIMIT 10;
+
+// -----------------------------------------------------------------------------
+// 5.6 ALGORITHME 5: RECOMMANDATION PERSONNALISÉE (Link Prediction)
+// -----------------------------------------------------------------------------
+
+// Adamic-Adar pour prédire de nouvelles amitiés (Friend Recommendation)
+CALL gds.adamicAdar.stream('social-graph')
+YIELD node1, node2, score
+WITH gds.util.asNode(node1) as u1, gds.util.asNode(node2) as u2, score
+WHERE u1.id < u2.id AND NOT (u1)-[:FRIENDS]-(u2)
+WITH u1, u2, score
+ORDER BY score DESC
+LIMIT 100
+MERGE (u1)-[p:POTENTIAL_FRIEND]->(u2)
+SET p.score = score, p.predicted = true;
+
+// Common Neighbors pour renforcer les recommandations
+CALL gds.commonNeighbors.stream('social-graph')
+YIELD node1, node2, score
+WITH gds.util.asNode(node1) as u1, gds.util.asNode(node2) as u2, score
+WHERE u1.id < u2.id AND NOT (u1)-[:FRIENDS]-(u2)
+WITH u1, u2, score
+ORDER BY score DESC
+LIMIT 100
+MERGE (u1)-[p:POTENTIAL_FRIEND]->(u2)
+ON CREATE SET p.common_neighbors = score
+ON MATCH SET p.common_neighbors = score;
+
+// -----------------------------------------------------------------------------
+// 5.7 ALGORITHME 6: NODE2VEC POUR EMBEDDINGS CONTEXTUELS
+// -----------------------------------------------------------------------------
+
+// Node2Vec pour capturer les patterns de navigation utilisateur
+CALL gds.node2vec.stream('yelp-complete', {
+  embeddingDimension: 64,
+  walkLength: 80,
+  iterations: 10,
+  inOutFactor: 1.0,
+  returnFactor: 1.0,
+  concurrency: 4
+})
+YIELD nodeId, embedding
+WITH gds.util.asNode(nodeId) as node, embedding
+SET node.node2vec_embedding = embedding;
+
+// -----------------------------------------------------------------------------
+// 5.8 ALGORITHME 7: TRIANGLES ET CLUSTERING (Analyse de réseau)
+// -----------------------------------------------------------------------------
+
+// Local Clustering Coefficient pour mesurer la cohésion des communautés
+CALL gds.localClusteringCoefficient.stream('social-graph')
+YIELD nodeId, localClusteringCoefficient, triangles
+WITH gds.util.asNode(nodeId) as user, localClusteringCoefficient, triangles
+SET user.clustering_coefficient = localClusteringCoefficient,
+    user.triangles = triangles;
+
+// -----------------------------------------------------------------------------
+// ÉTAPE 6: REQUÊTES DE RECOMMANDATION OPÉRATIONNELLES
+// -----------------------------------------------------------------------------
+
+// 6.1 Recommandation hybride: Content + Collaborative + Social
+PROFILE
+MATCH (target:User {id: 'some_user_id'})-[:INTERACTED_WITH]->(visited:Business)
+WITH target, collect(visited) as visitedBusinesses, avg(target.average_stars) as userAvgRating
+
+// Étape 1: Trouver des business similaires à ceux aimés (Content-based)
+MATCH (visited)-[s:SIMILAR_CONTENT]->(similar:Business)
+WHERE NOT similar IN visitedBusinesses
+WITH target, similar, sum(s.score) as contentScore, visitedBusinesses
+
+// Étape 2: Vérifier si les amis aiment ces business (Social-based)
+OPTIONAL MATCH (target)-[:FRIENDS]-(friend:User)-[:INTERACTED_WITH]->(similar)
+WITH similar, contentScore, count(friend) as friendCount, avg(friend.average_stars) as friendAvgRating
+
+// Étape 3: Calcul du score final hybride
+WITH similar, 
+     contentScore * 0.5 + 
+     log(friendCount + 1) * friendAvgRating * 0.3 + 
+     similar.stars * 0.2 as finalScore,
+     friendCount
+
+RETURN similar.name as Business, 
+       similar.categories as Categories,
+       similar.stars as Rating,
+       finalScore as RecommendationScore,
+       friendCount as FriendsWhoVisited
+ORDER BY finalScore DESC
+LIMIT 10;
+
+// 6.2 Recommandation par proximité géographique (Location-based)
+MATCH (u:User {id: 'some_user_id'})-[:INTERACTED_WITH]->(b:Business)
+WITH u, avg(point({latitude: b.latitude, longitude: b.longitude})) as userLocation
+
+MATCH (candidate:Business)
+WHERE point.distance(userLocation, candidate.location) < 5000  // 5km
+  AND NOT (u)-[:INTERACTED_WITH]->(candidate)
+WITH candidate, point.distance(userLocation, candidate.location) as distance
+ORDER BY candidate.stars DESC, distance ASC
+RETURN candidate.name, candidate.stars, distance
+LIMIT 10;
+
+// 6.3 Recommandation par communauté (Community-based)
+MATCH (u:User {id: 'some_user_id'})
+WITH u.community as userCommunity, u
+
+MATCH (peer:User)-[:INTERACTED_WITH]->(b:Business)
+WHERE peer.community = userCommunity 
+  AND peer.id <> u.id
+  AND NOT (u)-[:INTERACTED_WITH]->(b)
+WITH b, count(peer) as communityScore, avg(peer.average_stars) as avgPeerRating
+RETURN b.name, b.stars, communityScore, avgPeerRating
+ORDER BY communityScore DESC, avgPeerRating DESC
+LIMIT 10;
+
+// -----------------------------------------------------------------------------
+// ÉTAPE 7: TABLEAU DE BORD ET MÉTRIQUES
+// -----------------------------------------------------------------------------
+
+// Statistiques globales du graphe
+MATCH (u:User) RETURN count(u) as TotalUsers;
+MATCH (b:Business) RETURN count(b) as TotalBusinesses;
+MATCH (r:Review) RETURN count(r) as TotalReviews;
+MATCH (c:Category) RETURN count(c) as TotalCategories;
+MATCH ()-[f:FRIENDS]-() RETURN count(f)/2 as TotalFriendships;
+MATCH ()-[i:INTERACTED_WITH]->() RETURN count(i) as TotalInteractions;
+
+// Distribution des notes moyennes
+MATCH (b:Business)
+RETURN 
+  CASE 
+    WHEN b.stars >= 4.5 THEN 'Excellent (4.5-5)'
+    WHEN b.stars >= 4.0 THEN 'Très bon (4.0-4.4)'
+    WHEN b.stars >= 3.0 THEN 'Moyen (3.0-3.9)'
+    ELSE 'Faible (<3)'
+  END as RatingCategory,
+  count(*) as Count
+ORDER BY RatingCategory;
+
+// Top 10 influenceurs (PageRank)
+MATCH (u:User)
+WHERE u.pagerank IS NOT NULL
+RETURN u.name, u.pagerank, u.review_count, u.fans
+ORDER BY u.pagerank DESC
+LIMIT 10;
+
+// -----------------------------------------------------------------------------
+// NETTOYAGE DES PROJECTIONS GDS (Optionnel)
+// -----------------------------------------------------------------------------
+
+// CALL gds.graph.drop('user-business-interactions');
+// CALL gds.graph.drop('social-graph');
+// CALL gds.graph.drop('business-categories');
+// CALL gds.graph.drop('yelp-complete');SET b += apoc.map.clean(value,['attributes','hours','business_id','categories','address','postal_code'],[])
 WITH b,apoc.text.split(value.categories, ',\\s*')  as categories
 UNWIND categories as category
 MERGE(c:Category{id:category})
